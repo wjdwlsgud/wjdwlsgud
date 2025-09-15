@@ -1,0 +1,291 @@
+# -*- coding: utf-8 -*-
+import random
+import os
+import numpy as np
+import tensorflow as tf
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    # TensorFlow 결정론적 연산 활성화 (GPU 사용 시 필요)
+    tf.config.experimental.enable_op_determinism()
+
+# 시드 설정 함수 호출
+set_seed(42)
+
+
+
+import os
+import time
+import numpy as np
+import pandas as pd
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.callbacks import EarlyStopping
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
+
+import matplotlib
+matplotlib.use("Agg")  # 창 없이 저장
+import matplotlib.pyplot as plt
+
+# -------------------- 경로/옵션 --------------------
+DEMAND_PATH  = r"C:\vscode\demand\demand.csv"
+WEATHER_PATH = r"C:\vscode\demand\reference\asos_weighted_2021_2024_filled.csv"
+OUTPUT_DIR   = r"C:\vscode\demand\daily_runs_rolling"
+LOSS_DIR     = os.path.join(OUTPUT_DIR, "loss")
+PRED_DIR     = os.path.join(OUTPUT_DIR, "pred")
+os.makedirs(LOSS_DIR, exist_ok=True)
+os.makedirs(PRED_DIR, exist_ok=True)
+
+WINDOW_DAYS  = 1000        # 매일 학습 시 과거 사용 일수(롤링 윈도)
+SQU_LENGTH   = 48          # 총 타임스텝(과거 47 + y시점 X 1)
+PAST_LEN     = SQU_LENGTH - 1
+GAP_HOURS    = 48          # y까지 갭(과거 블록 마지막으로부터 48시간)
+MIN_HOURS    = PAST_LEN + GAP_HOURS  # 최소 필요 길이(=95시간)
+
+# -------------------- 데이터 로드/병합 --------------------
+demand_df  = pd.read_csv(DEMAND_PATH, encoding="utf-8")
+weather_df = pd.read_csv(WEATHER_PATH, encoding="utf-8")
+
+demand_df["datetime"]  = pd.to_datetime(demand_df["datetime"])
+weather_df["datetime"] = pd.to_datetime(weather_df["datetime"])
+
+df = pd.merge(demand_df, weather_df, on="datetime", how="inner")
+df = df.sort_values("datetime").drop_duplicates("datetime", keep="first").set_index("datetime")
+
+# 파생/정리
+df["hour"] = df.index.hour
+for cat_col in ["datetype", "holiday"]:
+    if cat_col in df.columns and not np.issubdtype(df[cat_col].dtype, np.number):
+        df[cat_col] = df[cat_col].astype("category").cat.codes
+
+# 과거 수요 지연 특성
+df["demand_t48"]  = df["demand"].shift(48)
+df["demand_t168"] = df["demand"].shift(168)
+df = df.dropna()
+
+feature_cols_all = [
+    "temp_C","humidity_pct","wind_ms","irr","precip_mm","hour","datetype","holiday",
+    "demand_t48","demand_t168"
+]
+feature_cols = [c for c in feature_cols_all if c in df.columns]
+target_col   = "demand"
+
+# -------------------- 유틸 함수 --------------------
+def create_sequences_gap_with_futureX(x_data, y_data, past_len, gap_hours):
+    x_data = np.asarray(x_data)
+    y_data = np.asarray(y_data).reshape(-1)
+    T, F = x_data.shape
+    X, Y = [], []
+    for i in range(past_len - 1, T - gap_hours):
+        y_idx = i + gap_hours
+        X_past = x_data[i - (past_len - 1): i + 1]    # (past_len, F)
+        X_fut  = x_data[y_idx: y_idx + 1]             # (1, F)
+        if X_fut.shape[0] == 0:
+            continue
+        X_seq = np.vstack([X_past, X_fut])            # (past_len+1, F)
+        X.append(X_seq); Y.append(y_data[y_idx])
+    if len(X) == 0:
+        return np.empty((0, past_len+1, x_data.shape[1])), np.empty((0, 1))
+    return np.array(X), np.array(Y).reshape(-1, 1)
+
+def build_Xseq_for_y_indices(x_data, past_len, gap_hours, y_indices):
+    x_data = np.asarray(x_data)
+    X_list = []
+    for y_idx in y_indices:
+        i = y_idx - gap_hours
+        if i < (past_len - 1):
+            continue
+        X_past = x_data[i - (past_len - 1): i + 1]
+        X_fut  = x_data[y_idx: y_idx + 1]
+        if X_fut.shape[0] == 0:
+            continue
+        X_seq  = np.vstack([X_past, X_fut])
+        X_list.append(X_seq)
+    return np.array(X_list)
+
+def build_model(time_steps, n_features):
+    m = Sequential([
+        LSTM(64, activation="relu", input_shape=(time_steps, n_features)),
+        Dense(1)
+    ])
+    m.compile(optimizer="adam", loss="mean_squared_error")
+    return m
+
+# -------------------- 로그 파일 --------------------
+pred_log_path = os.path.join(OUTPUT_DIR, "predictions_by_hour.csv")
+day_log_path  = os.path.join(OUTPUT_DIR, "daily_metrics.csv")
+if not os.path.exists(pred_log_path):
+    pd.DataFrame(columns=["datetime","y_true","y_pred"]).to_csv(pred_log_path, index=False, encoding="utf-8-sig")
+if not os.path.exists(day_log_path):
+    pd.DataFrame(columns=["date","MAE","MAPE","R2"]).to_csv(day_log_path, index=False, encoding="utf-8-sig")
+
+# -------------------- 2024년 대상일 리스트 (공휴일은 예측 스킵) --------------------
+all_2024_days = pd.to_datetime(df.loc["2024-01-01":"2024-12-31"].index.date).unique()
+
+# ETA 계산 변수
+durations = []  # 각 일자 처리 소요(초)
+total_days = len(all_2024_days)
+start_overall = time.time()
+
+for idx, day in enumerate(all_2024_days, start=1):
+    day = pd.Timestamp(day)
+    day_str = day.strftime("%Y-%m-%d")
+    loop_start = time.time()
+
+    # 예측 대상: 해당일 00~23시
+    pred_start = day
+    pred_end   = day + pd.Timedelta(hours=23)
+    if pred_end > df.index.max():
+        print(f"[{day_str}] 데이터 범위 밖 → 종료")
+        break
+    day_df = df.loc[pred_start:pred_end]
+
+    # (요청 1) 2024 예측대상일에 holiday==1이면 스킵
+    if ("holiday" in day_df.columns) and (day_df["holiday"].eq(1).any()):
+        print(f"[{day_str}] holiday==1 포함 → 예측 스킵")
+        # ETA 출력
+        elapsed = time.time() - loop_start
+        durations.append(elapsed)
+        avg = np.mean(durations) if durations else 0.0
+        remaining = total_days - idx
+        eta_sec = max(0.0, remaining * avg)
+        print(f"    진행 {idx}/{total_days} | 이번 소요 {elapsed:.1f}s | 남은 예상 {eta_sec/60:.1f}분")
+        continue
+
+    # 학습 구간: 전날 23:00까지 (최근 WINDOW_DAYS 사용)
+    train_end   = day - pd.Timedelta(hours=1)
+    train_start = max(df.index.min(), train_end - pd.Timedelta(days=WINDOW_DAYS) + pd.Timedelta(hours=1))
+    train_df_day = df.loc[train_start:train_end]
+
+    if len(train_df_day) < MIN_HOURS:
+        print(f"[{day_str}] 학습 데이터 부족(len={len(train_df_day)}) → 스킵")
+        elapsed = time.time() - loop_start
+        durations.append(elapsed)
+        avg = np.mean(durations) if durations else 0.0
+        remaining = total_days - idx
+        eta_sec = max(0.0, remaining * avg)
+        print(f"    진행 {idx}/{total_days} | 이번 소요 {elapsed:.1f}s | 남은 예상 {eta_sec/60:.1f}분")
+        continue
+
+    # --- 스케일링: 학습셋으로 fit ---
+    X_train_raw = train_df_day[feature_cols].to_numpy()
+    y_train_raw = train_df_day[target_col].to_numpy().reshape(-1, 1)
+
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_train_scaled = scaler_X.fit_transform(X_train_raw)
+    y_train_scaled = scaler_y.fit_transform(y_train_raw)
+
+    # --- 학습 시퀀스 생성 ---
+    X_seq, y_seq = create_sequences_gap_with_futureX(
+        X_train_scaled, y_train_scaled, past_len=PAST_LEN, gap_hours=GAP_HOURS
+    )
+    if len(X_seq) < 10:
+        print(f"[{day_str}] 학습 시퀀스 부족(len={len(X_seq)}) → 스킵")
+        elapsed = time.time() - loop_start
+        durations.append(elapsed)
+        avg = np.mean(durations) if durations else 0.0
+        remaining = total_days - idx
+        eta_sec = max(0.0, remaining * avg)
+        print(f"    진행 {idx}/{total_days} | 이번 소요 {elapsed:.1f}s | 남은 예상 {eta_sec/60:.1f}분")
+        continue
+
+    # 시간 순서 유지한 train/val 분리(뒤 10% 검증)
+    n_total = len(X_seq)
+    n_val   = max(1, int(np.round(n_total * 0.1)))
+    n_tr    = n_total - n_val
+    X_tr, y_tr = X_seq[:n_tr], y_seq[:n_tr]
+    X_val, y_val = X_seq[n_tr:], y_seq[n_tr:]
+
+    print(f"\n[{day_str}] 학습 시작 | samples train={len(X_tr)}, val={len(X_val)} "
+          f"| window={WINDOW_DAYS}d | seq_len={SQU_LENGTH} | gap={GAP_HOURS}h")
+
+    # --- 모델 학습 (요청 3: verbose 출력) ---
+    model = build_model(time_steps=X_tr.shape[1], n_features=X_tr.shape[2])
+    es = EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1)
+    history = model.fit(
+        X_tr, y_tr,
+        epochs=200,
+        batch_size=64,
+        validation_data=(X_val, y_val),
+        callbacks=[es],
+        verbose=1   # ← 진행상황(에폭별 손실) 출력
+    )
+
+    # --- 손실 곡선 저장 (요청 2: loss 폴더) ---
+    plt.figure(figsize=(9,4))
+    plt.plot(history.history["loss"], label="Train Loss")
+    plt.plot(history.history["val_loss"], label="Val Loss")
+    plt.title(f"{day_str} - Training vs Validation Loss")
+    plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    loss_path = os.path.join(LOSS_DIR, f"{day_str}.png")
+    plt.savefig(loss_path, dpi=150); plt.close()
+
+    # --- 당일 24시간 예측 ---
+    X_day_raw   = day_df[feature_cols].to_numpy()
+    y_day_raw   = day_df[target_col].to_numpy().reshape(-1, 1)
+    X_day_scaled = scaler_X.transform(X_day_raw)
+
+    # 학습X + 당일X 이어 붙여서, y 인덱스를 당일 24개로 지정
+    X_combined  = np.vstack([X_train_scaled, X_day_scaled])
+    base = len(X_train_scaled)
+    y_indices = list(range(base, base + 24))
+    X_pred_seq = build_Xseq_for_y_indices(
+        X_combined, past_len=PAST_LEN, gap_hours=GAP_HOURS, y_indices=y_indices
+    )
+    if X_pred_seq.shape[0] != 24:
+        print(f"[{day_str}] 예측 시퀀스 {X_pred_seq.shape[0]}개(24개 필요) → 스킵")
+        elapsed = time.time() - loop_start
+        durations.append(elapsed)
+        avg = np.mean(durations) if durations else 0.0
+        remaining = total_days - idx
+        eta_sec = max(0.0, remaining * avg)
+        print(f"    진행 {idx}/{total_days} | 이번 소요 {elapsed:.1f}s | 남은 예상 {eta_sec/60:.1f}분")
+        continue
+
+    pred_scaled = model.predict(X_pred_seq, verbose=0)
+    y_pred_day  = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
+    y_true_day  = y_day_raw.reshape(-1)
+
+    # --- 성능 지표 ---
+    mae_day  = mean_absolute_error(y_true_day, y_pred_day)
+    mape_day = mean_absolute_percentage_error(y_true_day, y_pred_day) * 100
+    r2_day   = r2_score(y_true_day, y_pred_day)
+    print(f"[{day_str}] 결과: MAE={mae_day:.2f} | MAPE={mape_day:.2f}% | R²={r2_day:.3f}")
+
+    # --- 예측-실측 그래프 저장 (요청 2: pred 폴더) ---
+    hours = np.arange(24)
+    plt.figure(figsize=(10,4))
+    plt.plot(hours, y_true_day, marker="o", label="Actual")
+    plt.plot(hours, y_pred_day, marker="s", label="Predicted")
+    plt.title(f"{day_str} - 24h Prediction vs Actual")
+    plt.xlabel("Hour (0-23)"); plt.ylabel("Demand")
+    plt.xticks(hours); plt.grid(True); plt.legend(); plt.tight_layout()
+    pred_path = os.path.join(PRED_DIR, f"{day_str}.png")
+    plt.savefig(pred_path, dpi=150); plt.close()
+
+    # --- 로그 적재 ---
+    datetimes = pd.date_range(start=pred_start, periods=24, freq="H")
+    pred_df = pd.DataFrame({"datetime": datetimes, "y_true": y_true_day, "y_pred": y_pred_day})
+    pred_df.to_csv(pred_log_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+
+    day_row = pd.DataFrame([{"date": day_str, "MAE": mae_day, "MAPE": mape_day, "R2": r2_day}])
+    day_row.to_csv(day_log_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+
+    # --- ETA 출력 (요청 4) ---
+    elapsed = time.time() - loop_start
+    durations.append(elapsed)
+    avg = np.mean(durations) if durations else 0.0
+    remaining = total_days - idx
+    eta_sec = max(0.0, remaining * avg)
+    print(f"진행 {idx}/{total_days} | 이번 소요 {elapsed:.1f}s | 평균 {avg:.1f}s | 남은 예상 {eta_sec/60:.1f}분")
+
+print("\n전체 종료. 총 소요: {:.1f}분".format((time.time() - start_overall)/60))
